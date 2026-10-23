@@ -13,6 +13,7 @@
   $env:APMIC_API_KEY = "你的金鑰"
   python ftrc_eval_v2.py            # 正式執行
   python ftrc_eval_v2.py --dry-run  # 只抽題並輸出題目清單，不呼叫 API
+  python ftrc_eval_v2.py --no-numeric-check  # 不套用 numeric_check，只用 LLM 分數
 """
 import csv
 import glob
@@ -39,6 +40,7 @@ SEED = 42
 TESTEE_TEMPERATURE = 0.1
 MAX_RETRIES = 3
 SLEEP_SEC = 0.5
+USE_NUMERIC_CHECK = True  # score() 之後套用 numeric_check（數值比對觸發 C1、推論過短 P4 上限 0.5）；--no-numeric-check 關閉
 
 ANSWERS_JSONL = os.path.join(OUT_DIR, "answers.jsonl")
 JUDGMENTS_JSONL = os.path.join(OUT_DIR, "judgments.jsonl")
@@ -50,9 +52,11 @@ JUDGE_SYSTEM = """你是金融領域的閱卷委員。你的任務是依照給�
 JUDGE_TEMPLATE = """# 評分標準：FTRC 五層次評分
 ## 評分點（P1～P5 只能給 0、0.5、1.0）
 - P1 核心結論：1.0 與參考答案一致且明確／0.5 方向正確但有保留或部分小題錯誤／0 錯誤或未給結論
+  以受測回答的【最終答案】（或最後明確結論）為準判定 P1。最終答案的數值或結論與參考答案不符時，P1 = 0，
+  即使推論過程正確；推論與最終答案前後矛盾時，同樣以最終答案判定。
 - P2 關鍵細節：1.0 關鍵數值、條件、分錄全部正確／0.5 部分正確／0 未提及或錯誤
 - P3 情境辨識：1.0 正確辨識題目所屬制度、準則或模型情境／0.5 隱含理解／0 誤判情境
-- P4 適用推論：1.0 推論鏈完整（公式→代入→結果，或原則→適用→結論）／0.5 有推論但跳步／0 無推論
+- P4 適用推論：1.0 完整呈現公式或原則 → 代入條件 → 結論／0.5 有推論但跳步，或只有一行算式、沒有說明／0 只有結論、沒有推論
 - P5 依據排錯：依題目性質認定依據——法規題看法規條號或名稱，會計題看準則（IFRS、IAS 等）編號或名稱，
   計量題（統計、經濟、財務）看公式、定理或模型名稱。1.0 引用具體且正確的依據／0.5 僅籠統提及／0 無依據或依據錯誤
 
@@ -61,6 +65,16 @@ JUDGE_TEMPLATE = """# 評分標準：FTRC 五層次評分
 - C2：出現幻覺（虛構法條、準則或數據），總分最高 2.0
 - C3：答非所問，總分最高 0.0
 - C4：多小題中有任一小題未作答，總分最高 3.0
+
+## P4 給分範例（通用示範題，與本題無關，只用來說明 P4 的給分尺度）
+示範題：某商品原價 800 元，先打 9 折，再以折後價格加收 5% 營業稅，消費者應付多少元？
+- P4 = 1.0（公式或原則 → 代入條件 → 結論）：
+  「先算折扣後價格：折後價 = 原價 × 折數 = 800 × 0.9 = 720 元。營業稅以折後價為稅基：應付金額 = 折後價 ×（1 + 稅率）
+  = 720 × 1.05 = 756 元。【最終答案】756 元。」
+- P4 = 0.5（只有一行算式、沒有說明）：
+  「800 × 0.9 × 1.05 = 756。【最終答案】756 元。」
+- P4 = 0（只有結論、沒有推論）：
+  「【最終答案】756 元。」
 
 ## 題目
 {question}
@@ -183,6 +197,27 @@ def score(pts, caps):
     return s, caps, raw, final
 
 
+def post_check(item, answer, s, caps, raw, final, enabled=None):
+    """在 score() 之後套用 numeric_check（A2 數值比對、A4 推論長度）。
+
+    回傳要寫入閱卷紀錄的欄位：P1～P5、raw_score、final_score、caps 為套用後分數；
+    llm_* 保留原始 LLM 分數，numeric_check 記錄比對明細與調整說明，方便對照。
+    """
+    if enabled is None:
+        enabled = USE_NUMERIC_CHECK
+    rec = {**s, "raw_score": raw, "final_score": final, "caps": ",".join(caps)}
+    if not enabled:
+        return rec
+    import numeric_check
+    chk = numeric_check.check(reference_text(item), answer)
+    s2, caps2, raw2, final2, note = numeric_check.apply(s, caps, chk, CAP_LIMITS, POINTS)
+    rec.update({f"llm_{p}": s[p] for p in POINTS})
+    rec.update({"llm_raw_score": raw, "llm_final_score": final, "llm_caps": ",".join(caps)})
+    rec.update({**s2, "raw_score": raw2, "final_score": final2, "caps": ",".join(caps2),
+                "numeric_check": {"numeric": chk["numeric"], "p4": chk["p4"], "adjust": note}})
+    return rec
+
+
 # ===== 統計 =====
 def wilcoxon_signed_rank(x, y):
     """成對 Wilcoxon 符號等級檢定（雙尾）。有 scipy 用 scipy，否則用常態近似。"""
@@ -258,7 +293,10 @@ def summarize(picked, results):
 
 # ===== 主程式 =====
 def main():
+    global USE_NUMERIC_CHECK
     dry = "--dry-run" in sys.argv
+    if "--no-numeric-check" in sys.argv:
+        USE_NUMERIC_CHECK = False
     os.makedirs(OUT_DIR, exist_ok=True)
     items = load_items()
     picked = sample_items(items)
@@ -300,8 +338,9 @@ def main():
                     print(f" 閱卷失敗：{e}")
                     continue
                 s, caps, raw_sum, final = score(pts, caps)
-                judgments[key] = {"ID": it["ID"], "model": m, **s, "raw_score": raw_sum, "final_score": final,
-                                  "caps": ",".join(caps), "cap_reasons": v.get("cap_reasons", ""),
+                judgments[key] = {"ID": it["ID"], "model": m,
+                                  **post_check(it, answers[key]["answer"], s, caps, raw_sum, final),
+                                  "cap_reasons": v.get("cap_reasons", ""),
                                   "evidence": {pid: pts[pid].get("evidence", "") for pid in POINTS},
                                   "judge_raw": raw}
                 append_jsonl(JUDGMENTS_JSONL, judgments[key])
