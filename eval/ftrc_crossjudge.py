@@ -87,12 +87,13 @@ def run_judging(items, answers):
             print(f" 閱卷失敗：{e}")
             continue
         s, caps, raw_sum, final = base.score(pts, caps)
-        rec = {"ID": key[0], "model": key[1], "judge": CROSS_JUDGE, **s, "raw_score": raw_sum,
-               "final_score": final, "caps": ",".join(caps), "cap_reasons": v.get("cap_reasons", ""),
+        rec = {"ID": key[0], "model": key[1], "judge": CROSS_JUDGE,
+               **base.post_check(it, answers[key]["answer"], s, caps, raw_sum, final),
+               "cap_reasons": v.get("cap_reasons", ""),
                "evidence": {pid: pts[pid].get("evidence", "") for pid in POINTS}, "judge_raw": raw}
         base.append_jsonl(CROSS_JSONL, rec)
         done[key] = rec
-        print(f" 得分 {final}／5")
+        print(f" 得分 {rec['final_score']}／5")
         time.sleep(base.SLEEP_SEC)
     base.MODEL_JUDGE = ORIG_JUDGE
     return done
